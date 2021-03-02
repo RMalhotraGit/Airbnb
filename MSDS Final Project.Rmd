@@ -1,0 +1,558 @@
+---
+title: "Analysis of Prices for Airbnb Listings in Major US Cities"
+author: "Rahul Malhotra"
+date: "12/22/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, include = FALSE}
+library(tidyverse)
+library(glmnet)
+library(gam)
+library(tree)
+library(randomForest)
+library(gbm)
+
+options(digits = 5, width = 100)
+```
+
+```{r warning = FALSE, include = FALSE}
+airbnbdata_all <- read_csv("train.csv")
+
+# removing certain columns/featuers
+airbnbdata <- airbnbdata_all[-c(1,5,12,13, 17,19,22,23,26,27)]
+airbnbdata <-  airbnbdata[-c(2)]
+
+# changing categorical variables to be factors
+airbnbdata$room_type = factor(airbnbdata$room_type)
+airbnbdata$bed_type = factor(airbnbdata$bed_type)
+airbnbdata$cancellation_policy = factor(airbnbdata$cancellation_policy)
+airbnbdata$cleaning_fee = factor(airbnbdata$cleaning_fee)
+airbnbdata$city = factor(airbnbdata$city)
+airbnbdata$host_has_profile_pic = factor(airbnbdata$host_has_profile_pic)
+airbnbdata$host_identity_verified = factor(airbnbdata$host_identity_verified)
+airbnbdata$instant_bookable = factor(airbnbdata$instant_bookable)
+
+# remove observations with missing data
+airbnbdata <- na.omit(airbnbdata)
+
+airbnbdata$host_response_rate <- as.numeric(str_replace_all(airbnbdata$host_response_rate,"%",""))
+```
+
+```{r warning = FALSE}
+set.seed(1)
+# split data into train and test sets
+traindata_size = dim(airbnbdata)[1]*0.8
+traindataindex = sample(1:dim(airbnbdata)[1], traindata_size)
+testdataindex = -traindataindex
+traindata = airbnbdata[traindataindex, ]
+testdata = airbnbdata[testdataindex, ]
+```
+
+```{r warning = FALSE}
+# full linear model
+lm.fit = lm(log_price~., data=traindata)
+lm.pred = predict(lm.fit, testdata)
+lm.testerror = mean((testdata$log_price - lm.pred)^2)
+```
+
+```{r}
+# backwards search model
+lm.fit.bs <- lm(log_price ~ room_type + accommodates + bathrooms + cancellation_policy + city + host_response_rate +instant_bookable + latitude + longitude + number_of_reviews  + review_scores_rating  + bedrooms + beds , data=traindata)
+
+lm.pred.bs = predict(lm.fit.bs, testdata, type = "response")
+lm.testerror.bs = mean((testdata$log_price - lm.pred.bs)^2)
+```
+
+```{r}
+# ridge regression
+train.mat = model.matrix(log_price~., data=traindata)
+test.mat = model.matrix(log_price~., data=testdata)
+grid = 10 ^ seq(10, -2, length=100)
+cv.mod.ridge = cv.glmnet(train.mat, as.matrix(traindata[, 'log_price']), alpha=0, lambda=grid, thresh=1e-12)
+lambda_best = cv.mod.ridge$lambda.min
+
+#coefficeints for the best lambda in ridge regression
+mod.ridge = glmnet (train.mat, as.matrix(traindata[, 'log_price']), alpha = 0)
+ridge.coef = predict(mod.ridge ,type="coefficients",s=lambda_best )[1:30 ,]
+#ridge.coef
+
+ridge.pred = predict(cv.mod.ridge, newx=test.mat, s=lambda_best)
+ridge.testerror = mean((testdata$log_price - ridge.pred[,1])^2)
+#paste("Ridge test error with best lambda ", lambda_best, "is:", ridge.testerror)
+```
+
+```{r warning = FALSE}
+# lasso model
+grid = 10 ^ seq(10, -2, length=100)
+cv.mod.lasso = cv.glmnet(train.mat, as.matrix(traindata[, 'log_price']), alpha=1, lambda=grid, thresh=1e-12)
+lambda_best = cv.mod.lasso$lambda.min
+
+#coefficeints for the best lambda
+mod.lasso=glmnet (train.mat, as.matrix(traindata[, 'log_price']),alpha =1)
+lasso.coef = predict(mod.lasso ,type="coefficients",s=lambda_best )[1:30 ,]
+#lasso.coef[lasso.coef!=0]
+
+# test error
+lasso.pred = predict(cv.mod.lasso, newx=test.mat, s=lambda_best)
+lasso.testerror = mean((testdata$log_price - (lasso.pred))^2)
+#paste("Lasso test error with best lambda " ,lambda_best , "is : ", lasso.testerror)
+```
+
+```{r}
+# table which stores test MSE for each linear model
+linear.results <- matrix(nrow = 4, ncol = 2)
+colnames(linear.results) <- c("Test MSE", "# of Coefficients")
+rownames(linear.results) <- c("Full Model", "Backwards Search", "Ridge", "Lasso")
+
+linear.results[1,1] <- lm.testerror
+linear.results[2,1] <- round(lm.testerror.bs, digits = 5)
+linear.results[3,1] <- round(ridge.testerror, digits = 5)
+linear.results[4,1] <- round(lasso.testerror, digits = 5)
+
+linear.results[1,2] <- length(lm.fit$coefficients)
+linear.results[2,2] <- length(lm.fit.bs$coefficients)-1
+linear.results[3,2] <- length(ridge.coef[ridge.coef!=0])
+linear.results[4,2] <- length(lasso.coef[lasso.coef!=0])+1
+```
+
+```{r, warning = FALSE}
+# natural cubic spline
+gam.cs = lm(log_price ~ ns(accommodates ,3)+ns(bathrooms ,3)+ ns(host_response_rate, knots = c(25,50,75)) + ns(number_of_reviews ,3) + ns(latitude ,3) +  ns(longitude ,3) + ns(review_scores_rating, knots = c(25,50,75)) + ns(bedrooms ,3) + ns(beds ,3) + room_type + bed_type + cancellation_policy + cleaning_fee + city + host_has_profile_pic + host_identity_verified + instant_bookable ,data=traindata)
+
+gam.cs.pred=predict(gam.cs, newdata = testdata)
+gam.cs.testerror = mean((testdata$log_price - gam.cs.pred)^2)
+#paste("Test error for GAM using natural cubic spline and step function is  : ", gam.cs.testerror)
+```
+
+```{r, warning = FALSE}
+# smoothing spline
+gam.ss = gam(log_price ~ s(accommodates)+s(bathrooms)+ s(host_response_rate) + s(number_of_reviews) + s(latitude) +  s(longitude) + s(review_scores_rating) + s(bedrooms) + s(beds) + room_type + bed_type + cancellation_policy + cleaning_fee + city + host_has_profile_pic + host_identity_verified + instant_bookable, data=traindata)
+
+gam.ss.pred = predict(gam.ss, newdata = testdata)
+gam.ss.testerror = mean((testdata$log_price - gam.ss.pred)^2)
+```
+
+```{r}
+# table which stores test MSE for each GAM
+gam.results <- matrix(nrow = 2, ncol = 1)
+colnames(gam.results) <- c("Test MSE")
+rownames(gam.results) <- c("Cubic Spline", "Smoothing Spline")
+
+gam.results[1,] <- gam.cs.testerror
+gam.results[2,] <- gam.ss.testerror
+```
+
+```{r}
+# regression tree
+reg.tree = tree(log_price~., data = traindata)
+
+reg.tree.pred = predict(reg.tree, testdata)
+reg.tree.testerror = mean((reg.tree.pred - testdata$log_price)^2)
+```
+
+```{r}
+# bagging
+set.seed(1)
+xvar<-c("room_type","accommodates","bathrooms","city","beds","bedrooms","cancellation_policy","longitude","review_scores_rating","cleaning_fee")
+tr<-traindata[xvar]
+
+bag1 = randomForest(x=tr, y=traindata$log_price, mtry=10, ntree=1, importance =TRUE)
+bag2 = randomForest(x=tr, y=traindata$log_price, mtry=10, ntree=5, importance =TRUE)
+bag3 = randomForest(x=tr, y=traindata$log_price, mtry=10, ntree=10, importance =TRUE)
+bag4 = randomForest(x=tr, y=traindata$log_price, mtry=10, ntree=20, importance =TRUE)
+
+bag1.pred <- predict(bag1, testdata)
+bag1.testerror <- mean((bag1.pred - testdata$log_price)^2)
+bag2.pred <- predict(bag2, testdata)
+bag2.testerror <- mean((bag2.pred - testdata$log_price)^2)
+bag3.pred <- predict(bag3, testdata)
+bag3.testerror <- mean((bag3.pred - testdata$log_price)^2)
+bag4.pred <- predict(bag4, testdata)
+bag4.testerror <- mean((bag4.pred - testdata$log_price)^2)
+```
+
+```{r}
+# bag results
+bag.results <- matrix(nrow = 4, ncol = 2)
+colnames(bag.results) <- c("Test MSE", "# of Trees")
+
+bag.results[1,1] <- bag1.testerror
+bag.results[2,1] <- bag2.testerror
+bag.results[3,1] <- bag3.testerror
+bag.results[4,1] <- bag4.testerror
+
+bag.results[1,2] <- bag1$ntree
+bag.results[2,2] <- bag2$ntree
+bag.results[3,2] <- bag3$ntree
+bag.results[4,2] <- bag4$ntree
+```
+
+```{r}
+# random forest
+set.seed(1)
+rf1 = randomForest(x = traindata[-1], y = traindata$log_price, mtry = 4, ntree = 1)
+rf2 = randomForest(x = traindata[-1], y = traindata$log_price, mtry = 4, ntree = 10)
+rf3 = randomForest(x = traindata[-1], y = traindata$log_price, mtry = 4, ntree = 30)
+rf4 = randomForest(x = traindata[-1], y = traindata$log_price, mtry = 4, ntree = 50)
+
+rf1.pred <- predict(rf1, testdata)
+rf1.testerror <- mean((rf1.pred - testdata$log_price)^2)
+rf2.pred <- predict(rf2, testdata)
+rf2.testerror <- mean((rf2.pred - testdata$log_price)^2)
+rf3.pred <- predict(rf3, testdata)
+rf3.testerror <- mean((rf3.pred - testdata$log_price)^2)
+rf4.pred <- predict(rf4, testdata)
+rf4.testerror <- mean((rf4.pred - testdata$log_price)^2)
+```
+
+```{r}
+# random forest results
+rf.results <- matrix(nrow = 4, ncol = 2)
+colnames(rf.results) <- c("Test MSE", "# of Trees")
+
+rf.results[1,1] <- rf1.testerror
+rf.results[2,1] <- rf2.testerror
+rf.results[3,1] <- rf3.testerror
+rf.results[4,1] <- rf4.testerror
+
+rf.results[1,2] <- rf1$ntree
+rf.results[2,2] <- rf2$ntree
+rf.results[3,2] <- rf3$ntree
+rf.results[4,2] <- rf4$ntree
+```
+
+```{r}
+# boosting
+boost1 = gbm(log_price~.,data=traindata, distribution="gaussian",n.trees = 4000, interaction.depth = 1)
+boost2 = gbm(log_price~.,data=traindata, distribution="gaussian",n.trees = 4000, interaction.depth = 2)
+boost3 = gbm(log_price~.,data=traindata, distribution="gaussian",n.trees = 4000, interaction.depth = 3)
+boost4 = gbm(log_price~.,data=traindata, distribution="gaussian",n.trees = 4000, interaction.depth = 4)
+```
+
+```{r}
+boost1.1.pred <- predict(boost1, newdata = testdata, n.trees = 100)
+boost1.1.testerror <- mean((boost1.1.pred - testdata$log_price)^2)
+boost1.2.pred <- predict(boost1, newdata = testdata, n.trees = 500)
+boost1.2.testerror <- mean((boost1.2.pred - testdata$log_price)^2)
+boost1.3.pred <- predict(boost1, newdata = testdata, n.trees = 1000)
+boost1.3.testerror <- mean((boost1.3.pred - testdata$log_price)^2)
+boost1.4.pred <- predict(boost1, newdata = testdata, n.trees = 2000)
+boost1.4.testerror <- mean((boost1.4.pred - testdata$log_price)^2)
+boost1.5.pred <- predict(boost1, newdata = testdata, n.trees = 3000)
+boost1.5.testerror <- mean((boost1.5.pred - testdata$log_price)^2)
+boost1.6.pred <- predict(boost1, newdata = testdata, n.trees = 4000)
+boost1.6.testerror <- mean((boost1.6.pred - testdata$log_price)^2)
+```
+
+```{r}
+boost2.1.pred <- predict(boost2, newdata = testdata, n.trees = 100)
+boost2.1.testerror <- mean((boost2.1.pred - testdata$log_price)^2)
+boost2.2.pred <- predict(boost2, newdata = testdata, n.trees = 500)
+boost2.2.testerror <- mean((boost2.2.pred - testdata$log_price)^2)
+boost2.3.pred <- predict(boost2, newdata = testdata, n.trees = 1000)
+boost2.3.testerror <- mean((boost2.3.pred - testdata$log_price)^2)
+boost2.4.pred <- predict(boost2, newdata = testdata, n.trees = 2000)
+boost2.4.testerror <- mean((boost2.4.pred - testdata$log_price)^2)
+boost2.5.pred <- predict(boost2, newdata = testdata, n.trees = 3000)
+boost2.5.testerror <- mean((boost2.5.pred - testdata$log_price)^2)
+boost2.6.pred <- predict(boost2, newdata = testdata, n.trees = 4000)
+boost2.6.testerror <- mean((boost2.6.pred - testdata$log_price)^2)
+```
+
+```{r}
+boost3.1.pred <- predict(boost3, newdata = testdata, n.trees = 100)
+boost3.1.testerror <- mean((boost3.1.pred - testdata$log_price)^2)
+boost3.2.pred <- predict(boost3, newdata = testdata, n.trees = 500)
+boost3.2.testerror <- mean((boost3.2.pred - testdata$log_price)^2)
+boost3.3.pred <- predict(boost3, newdata = testdata, n.trees = 1000)
+boost3.3.testerror <- mean((boost3.3.pred - testdata$log_price)^2)
+boost3.4.pred <- predict(boost3, newdata = testdata, n.trees = 2000)
+boost3.4.testerror <- mean((boost3.4.pred - testdata$log_price)^2)
+boost3.5.pred <- predict(boost3, newdata = testdata, n.trees = 3000)
+boost3.5.testerror <- mean((boost3.5.pred - testdata$log_price)^2)
+boost3.6.pred <- predict(boost3, newdata = testdata, n.trees = 4000)
+boost3.6.testerror <- mean((boost3.6.pred - testdata$log_price)^2)
+```
+
+```{r}
+boost4.1.pred <- predict(boost4, newdata = testdata, n.trees = 100)
+boost4.1.testerror <- mean((boost4.1.pred - testdata$log_price)^2)
+boost4.2.pred <- predict(boost4, newdata = testdata, n.trees = 500)
+boost4.2.testerror <- mean((boost4.2.pred - testdata$log_price)^2)
+boost4.3.pred <- predict(boost4, newdata = testdata, n.trees = 1000)
+boost4.3.testerror <- mean((boost4.3.pred - testdata$log_price)^2)
+boost4.4.pred <- predict(boost4, newdata = testdata, n.trees = 2000)
+boost4.4.testerror <- mean((boost4.4.pred - testdata$log_price)^2)
+boost4.5.pred <- predict(boost4, newdata = testdata, n.trees = 3000)
+boost4.5.testerror <- mean((boost4.5.pred - testdata$log_price)^2)
+boost4.6.pred <- predict(boost4, newdata = testdata, n.trees = 4000)
+boost4.6.testerror <- mean((boost4.6.pred - testdata$log_price)^2)
+```
+
+```{r}
+# boosting results
+boost.results <- matrix(nrow = 4, ncol = 6)
+rownames(boost.results) <- c("Interaction Depth = 1", "Interaction Depth = 2", "Interaction Depth = 3", "Interaction Depth = 4")
+colnames(boost.results) <- c("100 Trees", "500 Trees", "1,000 Trees", "2,000 Trees", "3,000 Trees", "4,000 Trees")
+
+boost.results[1,] <- c(boost1.1.testerror, boost1.2.testerror, boost1.3.testerror, boost1.4.testerror, boost1.5.testerror, boost1.6.testerror)
+boost.results[2,] <- c(boost2.1.testerror, boost2.2.testerror, boost2.3.testerror, boost2.4.testerror, boost2.5.testerror, boost2.6.testerror)
+boost.results[3,] <- c(boost3.1.testerror, boost3.2.testerror, boost3.3.testerror, boost3.4.testerror, boost3.5.testerror, boost3.6.testerror)
+boost.results[4,] <- c(boost4.1.testerror, boost4.2.testerror, boost4.3.testerror, boost4.4.testerror, boost4.5.testerror, boost4.6.testerror)
+```
+
+
+# Abstract
+
+The focus of the project is to design models which will be used to predict and interpret the price of various Airbnb listings in major US cities using several factors. Among the factors, the most important ones were determined while others were omitted due to a lack in predicting capability. These results are useful for Airbnb hosts looking to create a new listing, as they can prioritize their time and investments towards aspects of a listing that will yield them the most return on their investment. To conduct the analysis, a dataset containing 74,111 listings was used, which included 28 predictors and the response, which is the logarithm of a listing's price. Prior to any analysis, some predictors were omitted, such as those consisting of text, categorical variables with several (hundreds) classes, and listings with missing data. The final dataset consisted of 47,787 listings and 15 predictors. Then, analysis was done which included several different models from the three approaches: 1) linear, 2) non-linear, and 3) tree based. To evaluate the models, the test mean squared error (MSE) was reported and it was found that the random forest model performed the best.
+
+# Table of Contents
+
+List of tables .......................................................................................... 3
+
+List of graphs ........................................................................................ 10
+
+Introduction \ ........................................................................................ \ 12
+
+Linear Models ........................................................................................ 12
+
+   \ \ \ \ Simple Linear Regression \ .......................................................................... 12
+   
+   \ \ \ \ Backward Search ................................................................................... 12
+   
+   \ \ \ \ Ridge ............................................................................................. 13
+   
+   \ \ \ \ Lasso .............................................................................................. 13
+   
+   \ \ \ \ \ Comparison ....................................................................................... 13
+
+Generalized Additive Models .......................................................................... 14
+
+   \ \ \ \ Natural Cubic Spline ............................................................................... 14
+   
+   \ \ \ \ Smoothing Spline .................................................................................. 14
+   
+   \ \ \ \ \ Comparison ....................................................................................... 14
+  
+Tree Based Models ................................................................................... \ 15
+
+   \ \ \ \ Regression Tree .................................................................................... 15
+   
+   \ \ \ \ Bagging ........................................................................................... 15
+   
+   \ \ \ \ Random Forest .................................................................................... 15
+   
+   \ \ \ \ Boosting .......................................................................................... 16
+   
+  \ \ \ \ \ Comparison ....................................................................................... 16
+
+Conclusion ............................................................................................ 16
+
+References ............................................................................................ 16\
+
+
+\newpage
+
+# List of tables
+
+## Table 1: Summary of Full Linear Model (page 12)
+```{r}
+summary(lm.fit)
+```
+
+\newpage
+
+## Table 2: Summary of Best Subset (Using Backwards Search) Model (page 12)
+```{r}
+summary(lm.fit.bs)
+```
+
+\newpage
+
+## Table 3: Summary of Ridge Regression Model (page 13)
+```{r}
+ridge.coef[ridge.coef!=0]
+```
+
+\newpage
+
+## Table 4: Summary of Lasso Model (page 13)
+```{r}
+lasso.coef[lasso.coef!=0]
+```
+
+## Table 5: Comparing Test MSE of All Linear Models (page 13)
+```{r}
+linear.results
+```
+
+\newpage
+
+## Table 6: Summary of Natural Cubic Spline (page 14)
+```{r}
+summary(gam.cs)$coefficients
+```
+
+## Table 7: Summary of Smoothing Spline (page 14)
+```{r}
+summary(gam.ss)$parametric.anova
+summary(gam.ss)$anova
+```
+
+## Table 8: Comparing Test MSE of Generalized Additive Models (page 14)
+```{r}
+gam.results
+```
+
+## Table 9: Summary of Regression Tree (page 15)
+```{r}
+summary(reg.tree)
+paste(c("Regression Tree Test MSE:", round(reg.tree.testerror, digits = 5)), collapse = " ")
+```
+
+## Table 10: Bagging Results (page 15)
+```{r}
+bag.results
+```
+
+## Table 11: Random Forest Results (page 15)
+```{r}
+rf.results
+```
+
+## Table 12: Boosting Results (page 16)
+```{r}
+boost.results
+```
+
+\newpage
+
+# List of graphs
+
+## Graph 1: Regression Tree (page 15)
+```{r}
+#Plotting the tree
+plot(reg.tree, main = "Regression Tree")
+text(reg.tree, all=TRUE, cex=0.7)
+```
+
+## Graph 2: Importance of Variables in Bagging Model (page 15)
+```{r}
+varImpPlot(bag4, main = "Importance for Bagging with 20 Trees")
+```
+
+## Graph 3: Importance of Variables in Random Forest Model (page 15)
+```{r}
+varImpPlot(rf3, main = "Importance for Random Forest with 30 Trees")
+```
+
+```{r}
+varImpPlot(rf4, main = "Importance for Random Forest with 50 Trees")
+```
+
+\newpage
+
+# Introduction
+
+Founded in 2008, Airbnb is a company which hosts over six million worldwide listings for rental properties. Its main service is providing customers with a marketplace for a short-term property, usually a small home, to stay in during vacation. However, Airbnb itself does not own any of the properties. Instead, it allows hosts to list their properties on its platform in exchange for a commission. Airbnb's service has been on the rise in the last decade as an alternative to its main competition: hotels. Vacationers often find the utilties, such as a kitchen, and privacy of homes to be reasons for selecting Airbnb over hotels for their place to stay. In addition, hosts also compete with other listings on the platform. Thus, hosts must offer desirable listings to attract customers to choose theirs, rather than hotels or other listings.\
+
+By identifying which of the many factors involved within a listing contribute the most to its price, hosts can focus on them, both when creating a new listing or modifying a current one. As a result, they can maximize the price for the listing and in turn generate more profit. Within a listing, there are many different aspects that go beyond just what the property itself has. Some of these include the number and types of rooms, different policies and fees, and information about the listing and host such as reviws and ratings. A model that can identify the significance of these aspects towards a listing's price allows hosts to gauge which are worth investing time and money towards.
+
+# Linear Models
+
+Linear models estimate coefficients for the intercept and each category for all chosen predictors, such that the residual sum of squares (RSS) is minimized. Although linear models do not account for non-linearity or interactions between features, if the true model is linear, they can serve as the best fit. The full model, containing all predictors, and simplified models, using different reduction methods, were built to assess how a linear approach does with predicting the price of listings.
+
+## Simple Linear Regression
+
+Initially, a simple linear regression model was created including all of the remaining 15 predictors, giving us a total of 29 coefficients (including the intercept), to predict the log price. Interestingly, we can see from Table 1 that only one predictor, “bed_type”, was not significant at the 5% level. However, having all 15 predictors, some of which have several categories, is likely to lead to overfitting of the data so our next objective was to try and simplify the model.
+
+## Backward Search
+
+The first attempt at trying to simplify the model was using best subset selection with a backward search. To determine how many coefficients we should estimate in our model, we plotted various criteria, such as adjusted R-squared, Mallow's $C_p$, and BIC against the number of predictors. The BIC was chosen as the deciding criterion as it penalizes models with more predictors and found that it was minimized when the model had 21 coefficients (including the intercept). From Table 2, we can see that all of the predictors were significant, which is expected when doing a backward search. While this gave a simpler method, the backward search is a greedy algorithm, meaning that once a predictor is removed, it cannot be added back. Thus, predictors that have been removed may perform better in later stages so we were hesitant to choose this as the best linear model.
+
+## Ridge
+
+Before using another method to simplify the model by removing some of the predictors, we used ridge regression to shrink the coefficients we had in the simple linear regression model. The reasoning for this was that some of the predictors we have are likely to be correlated with one another since they are somewhat related and ridge regression is able to help deal with this. To choose the value of lambda, our tuning parameter, we created a grid of several values and used cross validation to find the best value. We then created our ridge model and compared these coefficients (Table 3) to the ones in the initial model (Table 1). We found that for the “city” variable, the coefficient in the initial model was shrunk by a factor of 60 to 900 times in the ridge, depending on the specific city. Also, we found that “latitude” and “longitude” were shrunk by a factor of 10 and 6000 times, respectively. These variables displayed a lot of shrinkage, which we believe makes sense as they all have to do with location and were thus likely correlated with one another.
+
+## Lasso
+
+For our final linear method, we implemented the lasso regression which both shrinks and omits some of the predictors from the simple linear regression model. Just as in the ridge implementation, we selected a grid of values for the tuning parameter, lambda, and chose the best one using cross validation. Table 4 shows the summary of the resulting model, which consisted of 11 predictors with a total of 18 coefficients (including the intercept). It had removed 11 of the coefficients from the initial model (Table 1), two of which were “latitude” and “longitude”, but kept the “city” variable, likely due to multicollinearity and the extreme shrinkage we saw in the ridge model.
+
+## Comparing Linear Models
+
+Table 5 show the test MSE calculated in each method. We see that the simple linear regression model gave us the smallest error. However, this is to be expected since it contains all the predictors and is likely overfitting the data, which is resulting in the small error. When we conducted the backwards search, the test error was marginally higher but only slightly simplified and used a greedy approach. The test errors for the ridge and lasso models are a bit greater than that of the simple linear method, but again, this is to be expected as they simplify the model and attempt to address some of the problems with the simple linear method, such as overfitting and multicollinearity.
+
+Among these four methods, we believe the most appropriate linear method would be the lasso model, as the test MSE is only about 6% greater than that of the simple linear model, but is much simpler in terms of the number of estimates (coefficients) it contains.
+
+\newpage
+
+# Non-Linear/General Additive Models (GAM)
+
+General additive model allows for a non-linear function for each variable with more accurate predictions, as well as nice interpretations and inferences. In addition, they allow for more flexibility in the model by increasing the number of knots while keeping the degree fixed, whereas in polynomial regression, the degree must be increased to introduce more flexibility. The degree is fixed in GAMs by making use of a piecewise cubic polynomial where the coefficients of the polynomial change based on where the knots are. The smoothness of the functions can be summarized by an effective degree of freedom. However, although an improvement to the linear models, this approach does not include and may miss important interactions between features. In addition, if the true model is linear, non-linear models will overfit the data. To assess how these models predict the price of listings, two different GAMs were built. In both models, step functions were used for the qualitative variables and for the quantitative variables, the natural cubic spline and smoothing spline were used and compared.
+
+## Natural Cubic Spline
+
+The first GAM that was built utilized the natural cubic spline. For the quantitative variables, the default degrees of freedom used was 3. For certain features, such as "host_response_rate" and "review_scores_rating", knots were sepcified at each quartile based on where the function of the feature may vary rapidly, rather than specifying the degrees of freedom. From Table 6, we can see see that the most significant variables in the model are those that deal with location, notably "longitude" and "city". Also, we can see that the two categories "LA" and "SF" have the largest coefficients which may indicate that the most expensive Airbnb listings tend to be in California. This may also explain why "longitude" has a larger coefficient than "latitude" since the state of California is more vertical than it is horizontal.
+
+## Smoothing Spline
+
+The second GAM utilized the smoothing spline which is a slightly modified version of the natural cubic spline. It can be thought of as a natural cubic spline with knots at every unique value of $x_i$, where $x_i$ is the value of the input features for the $ith$ listing. However, since there will be many more knots, and as a result many more degrees of freedom, compared to the natural cubic spline, a tuning parameter $\lambda$ is used to control the roughness of the smoothing spline and hence, the effective degree of freedom. Table 7 shows the summary of the smoothing spline model's effects. Again, we can see that "longitude" and "city" are among the most significant variables, in addition to "accommodates", "bathrooms", "review_scores_rating", and "room_type".
+
+## Comparing GAMs
+
+Table 8 shows the test error for each of the two splines used in the GAMs. As expected, both perform better than any of the linear models because they account for non-linearity in the relationship between the price and predictors, thus, allowing for more flexibility. However, the added flexibility does come with the risk of overfitting, especially if the true model is in fact linear. Comparing the two GAMs against one another, we see that the natural cubic spline performs slightly better than the smoothing spline, with a 4% smaller test MSE. Thus, since the smoothing spline has more degrees of freedom, the most approporiate GAM would be the one using a natural cubic spline as it has a smaller test MSE and does not overfit as much as the smoothing spline.
+
+\newpage
+
+# Tree Based Models
+
+Tree based models offer a different and unique set of techniques to approach regression problems. Instead of considering the absolute quantity of a predictor, the predictor is segmented into a number of regions. Each of these regions contain a particular range of values for a predictor and can be thought of as nodes on a decision tree. In other words, we can think of a decision tree as taking a quantitiative variable and giving it different classes based on ranges of values. Then, each region of the predictor will have its own contribution to the response. In order to decide how to build the decision tree, a similar goal as in the linear approach is used where our target is to minimize the RSS. The first type of tree model that was built was a baseline approach which involved a simple regression tree. The following models that were built then used the decision tree as a building block to achieve a more refined tree based approach.
+
+## Regression Tree
+
+Our initial tree based approach involved fitting a regression tree. The output indicated that only 4 of the predictors were usedin the tree construction. We also checked to see whether pruning the tree improved its performance. Comparing both trees, we found that a lower test MSE was obtained when using the unpruned tree. From the summary of the tree (Table 9), we can see that the four predictors included in the tree are "room_type", "longitude", "bathrooms", and "city", again, highlighting the importance of the location variables. The graph of the tree (Graph 1) gives a visualization of the tree and how the splits of the predictors are done.
+
+## Bagging
+
+The first advanced tree based approach we tried was bagging. This involves creating multiple trees where each tree contains a different sample of the training set. In each node of the tree, different predictors are tried as "split candidates" to see which will minimize the RSS. Normally, we would try every predictor in our data, however since our dataset has too many predictors, we decided to use just the 10 most significant ones in order to reduce the running time of this approach. One benefit of bagging is that it is able to reduce variance and overfitting, even as the number of trees increase. In fact, as the number of trees gets larger, the error comes down, almost converging to a minimum. Table 10 shows the test MSE obtained using bagging for different number of trees. We can see that as get to around 20 trees, the decrease in the test MSE is fairly minimal and will not decrease much more as we increase the number of trees. Looking at the importance plots (Graph 2), we see variables "longtiude", "room_type", and "bathroom" appear as some of the most important variables, similar to what we saw in the GAMs. 
+
+## Random Forest
+
+The random forest approach is a slight advancement to the bagging method as it decorrelates the trees in the case of one very strong predictor. In fact, bagging is a special case of a random forest, specifically when we set the number of predictors to consider at each node to be the number of predictors in our dataset. Typically, we set the number of predictors to consider at each node, $m$, as $m \approx \sqrt{p}$, where $p$ is the total number of predictors. Then from these $m$ predictors, one is chosen as the actual predictor to split on, based on which minimizes the RSS. For our dataset, we set $m = 4$ as there are 17 predictors. Table 11 shows the test MSE obtained using the random forest approach and for different number of trees. We see the test MSE is lower than in any of the previous methods and beyond about 30 trees, the decrease in test MSE is minimal. The number of trees used in the random forest model is important to consider. Although the model will improve as the number of trees increase, it will overfit the data more as well. In Graph 3, the importance of each predictor is plotted when using 30 and 50 trees. In bot, we can see that "room_type" has the most importance by a large margin. In addition, "longitude", "bathrooms", "latitude", and "accommodates" also appear among the predictors with the most importance.
+
+## Boosting
+
+Boosting is a similar tree based method to bagging and random forest but differs slightly in the construction of its trees. In the prior two methods, mulitple trees are built independently and then they are averaged. In boosting, the trees are dependent as they are built sequentially, meaning that each new tree is grown using information from the previously built trees. The model will slowly learn and update the tree based on where previous trees performed poorly. Table 12 shows the test MSE obtained with varying numbers of trees and the level of interaction depth. Although we expect the test MSE to decrease as the number of trees and interaction depth increase, overfitting can become an issue. We can see that as we get past about 1,000 trees the test MSE does not decrease by much. However, at this number of trees and beyond, we see the lowest test MSE among all of the models, especially for the boosting models with a higher level of interaction depth in its trees.
+
+## Comparing Tree Based Models
+
+Of the tree based models, the regression tree is the simplest and has the highest test MSE when more trees are used in the other models. Of the refined tree approaches, we see bagging gets much better results than the regression tree and does not suffer from overfitting, unlike the random forest and boosting models. However, these two models do get a lower test MSE than any of the other models. Thus, if the number of trees is not an issue, boosting would be the best tree based model, followed by random forest. If it were an issue and we would want to prevent overfitting the data, then the bagging model would be best.
+
+# Conclusion
+
+After having utilized all three approaches to this problem, we compared each, highlighting their advantages and disadvantages. For the linear methods, the main advantage is their simplicity, especially when implementing a lasso regression to both shrink and omit some predictors. The linear models are simpler than those produced by the non-linear methods, in terms of the number of coefficients to estimate, however, they fail to capture any nonlinearity. Thus, the linear approach, specifically lasso, is only best if the true model itself is linear.
+
+When the true model is not linear, then the general additive models are able to generate models which may be closer to the truth, while also reducing the test error in comparison to the linear methods. In addition, they are much more computationally efficient compared to the tree based methods. However, they can result in worse overfitting compared to the linear models and still do not consider interactions between predictors.
+
+The tree based models, specifically the boosting method, gave us the smallest test MSE among all models. However, we must note that this may be due to overfitting, as a large number of trees can result in too many splits of the data. Also, the tree based methods can be computationally inefficient and take a long time to generate, depending on the number of trees and variables that are chosen for each split.
+
+In conclusion, the boosting approach offers the lowest test MSE for predicting the prices of Airbnb listings, but at a greater likelihood of overfitting the training data. Thus, it may be approproiate to decrease the number of trees when using this model, or implement an overfitting reduction technique. However, if the true model is simpler and linear, then the lasso model may be the best model to use for this problem.
+
+# References
+
+Hastie, Tibshirani, and Friedman. The Elements of Statistical Learning. Springer, 2009, 2ed. Book version: https://web.stanford.edu/~hastie/ElemStatLearn/
+
+Witten, Hastie, James, Tibshirani. An Introduction to Statistical Learning: With Applications in R. Springer, 2013,
+Corrected 8th printing. Book version: http://faculty.marshall.usc.edu/gareth-james/
+
+# Dataset
+
+Deloitte. (2017). AirBnB listings in major US cities. Version 1. Retrieved April 15, 2020 from
+https://www.kaggle.com/rudymizrahi/airbnb-listings-in-major-us-cities-deloitte-ml
+
+
